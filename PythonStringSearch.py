@@ -28,11 +28,11 @@ ignore_extensions = [
 # The script will search for these strings case-insensitively.
 # Special characters in these strings will be treated as literal characters.
 strings_to_search = [
-    "edge-services-qa.stgedge.com", # This happens to be a URL
+    "edge-services-qa.stgedge.com", # This happens to be a URL-like string
     "ERROR_CODE_XYZ",               # This could be an error code
     "UserLoginFailedEvent",         # This could be a specific event keyword
     "critical system alert",
-    "testtest.com"
+    "testtest.com"                  # A test string
 ]
 
 # Define a threshold for "massive" plain text files (in bytes).
@@ -58,15 +58,15 @@ def process_file_worker(file_path, compiled_patterns_with_originals):
                skip_reason is None if the file was processed (even if no strings were found),
                and contains an error message if the file could not be processed.
     """
-    # This print indicates which file a worker is starting on.
-    # In parallel execution, output from different workers might interleave.
     print(f"Worker starting on: {file_path}")
 
     found_results_for_this_file = []
     is_gz_file = file_path.lower().endswith(".gz")
+    search_was_performed_on_actual_content = False # Flag to track if we actually iterated searchable lines
 
     try:
-        opened_file_stream = None # Will hold the file object for .gz or massive plain text
+        opened_file_stream = None
+        lines_from_small_file = None # To hold lines if it's a small plain text file
 
         # --- Handle .gz files (stream processing, memory efficient) ---
         if is_gz_file:
@@ -74,49 +74,54 @@ def process_file_worker(file_path, compiled_patterns_with_originals):
                 opened_file_stream = gzip.open(file_path, 'rt', encoding='utf-8', errors='ignore')
             except gzip.BadGzipFile as e_bad_gz:
                 return file_path, [], f"Corrupted/Invalid .gz file: {e_bad_gz}"
-            except Exception as e_gz: # Other errors opening/reading gzip stream
+            except Exception as e_gz:
                 return file_path, [], f"Error reading gzipped file: {e_gz}"
         # --- Handle plain text files ---
         else:
             try:
                 file_size = os.path.getsize(file_path)
-                # For smaller plain text files, read all lines at once for potentially faster processing.
                 if file_size <= MASSIVE_PLAIN_TEXT_THRESHOLD_BYTES:
-                    lines_to_process_directly = []
-                    try: # Try UTF-8 first
+                    # Process smaller plain text files by reading all lines at once
+                    try:
                         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f_text:
-                            lines_to_process_directly = f_text.readlines()
-                    except UnicodeDecodeError: # Fallback to Latin-1 if UTF-8 fails
+                            lines_from_small_file = f_text.readlines()
+                    except UnicodeDecodeError:
                         print(f"Info (worker): UTF-8 decode failed for small file {file_path}, trying Latin-1.")
                         try:
                             with open(file_path, 'r', encoding='latin-1', errors='ignore') as f_text_latin:
-                                lines_to_process_directly = f_text_latin.readlines()
-                        except Exception as e_small_latin: # Error even with Latin-1
+                                lines_from_small_file = f_text_latin.readlines()
+                        except Exception as e_small_latin:
                             return file_path, [], f"Error opening/reading small text file with Latin-1: {e_small_latin}"
-                    except Exception as e_small_utf8: # Other error with UTF-8
+                    except Exception as e_small_utf8:
                         return file_path, [], f"Error opening/reading small text file with UTF-8: {e_small_utf8}"
-
-                    # Process lines from the small file directly
-                    for line_number, line_content in enumerate(lines_to_process_directly, 1):
-                        for original_string, compiled_pattern in compiled_patterns_with_originals:
-                            if compiled_pattern.search(line_content):
-                                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                result = (f"[{timestamp}] File: {file_path} | Line: {line_number} | "
-                                          f"Found String: \"{original_string}\" | Context: {line_content.strip()}")
-                                found_results_for_this_file.append(result)
-                    return file_path, found_results_for_this_file, None # Successfully processed small file
-
+                    
+                    if lines_from_small_file: # If lines were successfully read
+                        search_was_performed_on_actual_content = True # Content is available for search
+                        for line_number, line_content in enumerate(lines_from_small_file, 1):
+                            for original_string, compiled_pattern in compiled_patterns_with_originals:
+                                if compiled_pattern.search(line_content):
+                                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                    result = (f"[{timestamp}] File: {file_path} | Line: {line_number} | "
+                                              f"Found String: \"{original_string}\" | Context: {line_content.strip()}")
+                                    found_results_for_this_file.append(result)
+                    # Small file processing path concludes, results (or empty list) are set.
+                    
                 else: # Massive plain text file, open a stream for line-by-line reading
                     print(f"Info (worker): File '{file_path}' is massive (>{MASSIVE_PLAIN_TEXT_THRESHOLD_BYTES / (1024*1024):.0f}MB), will read line-by-line.")
                     opened_file_stream = open(file_path, 'r', encoding='utf-8', errors='ignore')
 
-            except Exception as e_open_prepare: # Error during size check or initial open attempt for plain text
+            except Exception as e_open_prepare:
                 return file_path, [], f"Error preparing plain text file for reading: {e_open_prepare}"
         
         # --- Common stream processing logic (for opened .gz or massive plain text files) ---
         if opened_file_stream:
             try:
+                lines_iterated_from_stream = 0
                 for line_number, line_content in enumerate(opened_file_stream, 1):
+                    if lines_iterated_from_stream == 0: # First line successfully read from stream
+                        search_was_performed_on_actual_content = True
+                    lines_iterated_from_stream += 1
+                    
                     for original_string, compiled_pattern in compiled_patterns_with_originals:
                         if compiled_pattern.search(line_content):
                             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -125,34 +130,53 @@ def process_file_worker(file_path, compiled_patterns_with_originals):
                                 f"Found String: \"{original_string}\" | Context: {line_content.strip()}"
                             )
                             found_results_for_this_file.append(result)
+                if lines_iterated_from_stream == 0 and os.path.getsize(file_path) > 0: 
+                    print(f"Info (worker): Stream for '{file_path}' yielded no lines (e.g. empty after GZip, or binary content ignored).")
+
             except UnicodeDecodeError: # Fallback for massive plain text if primary utf-8 stream failed
-                if not is_gz_file: # Only relevant for plain text massive files
+                if not is_gz_file: 
                     try:
-                        opened_file_stream.close() # Close previous utf-8 stream
+                        opened_file_stream.close() 
                         print(f"Info (worker): Retrying massive plain text file '{file_path}' with Latin-1 encoding.")
                         with open(file_path, 'r', encoding='latin-1', errors='ignore') as f_latin_stream:
+                            lines_iterated_from_latin_stream = 0
                             for line_number, line_content in enumerate(f_latin_stream, 1):
+                                if lines_iterated_from_latin_stream == 0:
+                                    search_was_performed_on_actual_content = True
+                                lines_iterated_from_latin_stream +=1
                                 for original_string, compiled_pattern in compiled_patterns_with_originals:
                                     if compiled_pattern.search(line_content):
                                         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                         result = (f"[{timestamp}] File: {file_path} | Line: {line_number} | "
                                                   f"Found String: \"{original_string}\" | Context: {line_content.strip()}")
                                         found_results_for_this_file.append(result)
-                    except Exception as e_latin_stream: # Error during Latin-1 stream attempt
+                            if lines_iterated_from_latin_stream == 0 and os.path.getsize(file_path) > 0:
+                                print(f"Info (worker): Latin-1 stream for '{file_path}' yielded no lines.")
+                    except Exception as e_latin_stream: 
                         return file_path, found_results_for_this_file, f"Error in latin-1 stream for massive plain text: {e_latin_stream}"
-            except Exception as e_stream_read: # Other errors during stream reading
+            except Exception as e_stream_read: 
                  return file_path, found_results_for_this_file, f"Error reading stream for {file_path}: {e_stream_read}"
             finally:
-                if opened_file_stream: # Ensure stream is closed
+                if opened_file_stream: 
                     opened_file_stream.close()
         
-        # Check if the file was processed but no strings were found (and it wasn't empty to begin with)
-        if os.path.getsize(file_path) > 0 and not found_results_for_this_file:
-            print(f"Info (worker): File '{file_path}' processed but no matching strings found or content was unsearchable/empty of relevant data.")
+        # --- Final Informational Message Logic ---
+        # This applies if the file path for small files was taken, or if streamed processing completed.
+        file_actually_has_size = os.path.getsize(file_path) > 0
 
+        if file_actually_has_size and not found_results_for_this_file:
+            if search_was_performed_on_actual_content:
+                print(f"Info (worker): File '{file_path}' was read and searched (content was processed), but no target strings were found.")
+            else:
+                # This means file has size, no results found, AND no actual lines were iterated for search.
+                # Could be binary with errors='ignore', or an empty .gz archive, or a small plain text file that readlines() yielded empty list.
+                print(f"Info (worker): File '{file_path}' has size but yielded no searchable text lines (e.g., binary, encoding issues, or effectively empty after decoding/decompression).")
+        elif not file_actually_has_size and not found_results_for_this_file: # File is 0 bytes
+             print(f"Info (worker): File '{file_path}' is empty (0 bytes).")
+        
         return file_path, found_results_for_this_file, None # Success for this file
 
-    except Exception as e_outer_worker: # Catch-all for any unexpected errors within the worker for this file
+    except Exception as e_outer_worker: 
         return file_path, [], f"Unexpected error in worker for file '{file_path}': {e_outer_worker} \n{traceback.format_exc()}"
 
 # --- Main Script Logic ---
@@ -177,7 +201,7 @@ def main_script_logic():
         print("Error: No valid strings to search for after attempting to compile patterns.")
         return
 
-    initial_skipped_file_log = [] # Stores records of files skipped before parallel processing (e.g., ignored extension)
+    initial_skipped_file_log = [] # Stores records of files skipped before parallel processing
 
     # --- Print Initial Configuration and Search Parameters ---
     print(f"Searching for specific strings in: {target_directory}")
@@ -197,11 +221,10 @@ def main_script_logic():
         except OSError as e:
             print(f"Warning: Could not clear existing output file '{output_file_path}': {e}")
     
-    # Ensure output directory exists before workers try to write (though workers don't write directly to final file)
-    # This is more for the final aggregation and skipped log.
+    # Ensure output directory exists
     try:
         output_dir_main = os.path.dirname(output_file_path)
-        if output_dir_main and not os.path.exists(output_dir_main):
+        if output_dir_main and not os.path.exists(output_dir_main): # Check if dirname is not empty (e.g. for relative paths)
             os.makedirs(output_dir_main)
             print(f"Created output directory: {output_dir_main}")
     except Exception as e_dir_create:
@@ -214,29 +237,25 @@ def main_script_logic():
         if include_subdirectories:
             for root, _, files in os.walk(target_directory):
                 for file_name in files:
-                    # os.walk can list directories as files in some rare edge cases with symlinks,
-                    # so an explicit check can be useful, though usually 'files' from os.walk are files.
-                    if not os.path.isdir(os.path.join(root, file_name)):
+                    if not os.path.isdir(os.path.join(root, file_name)): 
                         files_to_consider.append(os.path.join(root, file_name))
-        else: # Only top-level directory
+        else: 
             for file_name in os.listdir(target_directory):
                 full_path = os.path.join(target_directory, file_name)
-                if os.path.isfile(full_path): # Ensure it's a file
+                if os.path.isfile(full_path): 
                     files_to_consider.append(full_path)
     except FileNotFoundError:
         err_msg = f"Target directory '{target_directory}' not found."
         print(f"CRITICAL ERROR: {err_msg}")
         initial_skipped_file_log.append({'path': target_directory, 'reason': err_msg})
-    except Exception as e: # Other errors accessing directory (e.g., permissions)
+    except Exception as e: 
         err_msg = f"Error accessing target directory '{target_directory}': {e}"
         print(f"CRITICAL ERROR: {err_msg}")
         initial_skipped_file_log.append({'path': target_directory, 'reason': err_msg})
 
-    # Handle cases where directory access failed or no files were found
     if not files_to_consider:
-        if not initial_skipped_file_log: # No specific error logged, just no files
+        if not initial_skipped_file_log: 
              print(f"No files found in '{target_directory}'.")
-        # Log any initial skipped items (like directory access failure) and exit
         if initial_skipped_file_log: log_skipped_files(initial_skipped_file_log, output_file_path)
         return
 
@@ -245,16 +264,14 @@ def main_script_logic():
     # --- Filter out ignored files and prepare arguments for workers ---
     files_to_process_with_args = []
     for file_path in files_to_consider:
-        # Get file extension, convert to lowercase for case-insensitive comparison
         file_ext = os.path.splitext(file_path)[1].lower()
         if file_ext in ignore_extensions:
             reason = f"Ignored extension: {file_ext}"
             initial_skipped_file_log.append({'path': file_path, 'reason': reason})
-            continue # Skip this file
-        # Prepare arguments for the worker function: (file_path, list_of_compiled_patterns)
+            continue 
         files_to_process_with_args.append((file_path, compiled_patterns))
 
-    if not files_to_process_with_args: # All files were ignored or none were found initially
+    if not files_to_process_with_args: 
         print(f"No files to process after applying ignore list.")
         if initial_skipped_file_log: log_skipped_files(initial_skipped_file_log, output_file_path)
         return
@@ -262,64 +279,51 @@ def main_script_logic():
     print(f"Submitting {len(files_to_process_with_args)} files to worker processes...")
 
     # --- Parallel Processing ---
-    all_found_result_lines = [] # Stores all result strings from all workers
-    worker_skipped_file_log = [] # Stores records of files skipped by workers due to errors
-    found_files_set = set() # Tracks unique file paths where strings were found
+    all_found_result_lines = [] 
+    worker_skipped_file_log = [] 
+    found_files_set = set() 
 
-    # Determine number of worker processes.
-    # Using os.cpu_count() - 2 can be a good starting point to leave resources for OS/other tasks.
-    # Ensure at least 1 worker.
     num_workers = max(1, os.cpu_count() - 2 if os.cpu_count() and os.cpu_count() > 2 else 1)
     print(f"Using up to {num_workers} worker processes.")
 
     processed_count = 0
     total_files_to_process = len(files_to_process_with_args)
 
-    # Using ProcessPoolExecutor to manage a pool of worker processes
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-        # Submit all file processing tasks to the executor pool
-        # future_to_filepath maps a Future object to the filepath it's processing, for easier error reporting
         future_to_filepath = {
             executor.submit(process_file_worker, *args_for_worker): args_for_worker[0] 
             for args_for_worker in files_to_process_with_args
         }
 
-        # Process results as they are completed by the workers
         for future in concurrent.futures.as_completed(future_to_filepath):
             file_path_processed = future_to_filepath[future]
             processed_count += 1
             
-            # Basic progress indicator
-            if total_files_to_process > 20: # Avoid too much printing for few files
-                # Print a dot for most, and a count at intervals
-                progress_marker = "." if processed_count % (total_files_to_process // 20 if total_files_to_process > 100 else 10) != 0 else f" {processed_count}/{total_files_to_process} "
+            if total_files_to_process > 20: 
+                progress_marker = "." if processed_count % (max(1, total_files_to_process // 20 if total_files_to_process > 100 else 10)) != 0 else f" {processed_count}/{total_files_to_process} "
                 print(progress_marker, end="", flush=True)
-            else: # For fewer files, print each completion
+            else: 
                  print(f"\nCompleted: {os.path.basename(file_path_processed)} ({processed_count}/{total_files_to_process})")
 
             try:
-                # Get the result from the worker: (file_path, list_of_results, skip_reason)
                 _fp_returned, result_lines_from_worker, skip_reason = future.result()
-                if skip_reason: # Worker reported an error for this file
+                if skip_reason: 
                     worker_skipped_file_log.append({'path': file_path_processed, 'reason': skip_reason})
-                if result_lines_from_worker: # Worker found matching strings
+                if result_lines_from_worker: 
                     all_found_result_lines.extend(result_lines_from_worker)
-                    found_files_set.add(file_path_processed) # Mark this file as having matches
-            except Exception as exc: # Error retrieving result from future (e.g., worker process crashed)
+                    found_files_set.add(file_path_processed) 
+            except Exception as exc: 
                 reason = f"Worker process CRASHED or unhandled error for {file_path_processed}: {exc} \n{traceback.format_exc()}"
-                print(f"\nERROR: {reason}") # Ensure newline if progress dots were used
+                print(f"\nERROR: {reason}") 
                 worker_skipped_file_log.append({'path': file_path_processed, 'reason': reason})
     
-    print("\nAll worker processes finished.") # Newline after any progress printing
-
-    # Consolidate all skipped file logs (initial skips + worker skips)
+    print("\nAll worker processes finished.") 
     final_skipped_log = initial_skipped_file_log + worker_skipped_file_log
 
     # --- Write Aggregated Results to Output File ---
     if all_found_result_lines:
         print(f"\nAggregating and writing {len(all_found_result_lines)} found lines to output file...")
         try:
-            # Append results to the (cleared) output file
             with open(output_file_path, 'a', encoding='utf-8') as out_f:
                 for line in all_found_result_lines:
                     out_f.write(line + "\n")
@@ -336,7 +340,6 @@ def main_script_logic():
     else:
         print("No occurrences of the specified strings were found in the searched files.")
     
-    # Log any skipped or errored files
     if final_skipped_log:
         log_skipped_files(final_skipped_log, output_file_path)
 
@@ -355,33 +358,29 @@ def log_skipped_files(skipped_records, output_file_path_param):
         if output_dir and not os.path.exists(output_dir):
             try:
                 os.makedirs(output_dir)
-                # print(f"Info: Created output directory for skipped log: {output_dir}") # Can be noisy
             except Exception:
-                pass # If it fails here, the write below will likely also fail.
+                pass # If it fails here, the write below will likely also fail and print an error.
 
         with open(output_file_path_param, 'a', encoding='utf-8') as out_f:
             out_f.write(skipped_header + "\n")
             for record in skipped_records:
                 log_entry = f"File: {record['path']} | Reason: {record['reason']}"
-                print(log_entry) # Also print to console
+                print(log_entry) 
                 out_f.write(log_entry + "\n")
     except IOError as e:
         print(f"Error: Could not write skipped files log to '{output_file_path_param}': {e}")
 
 # This guard is crucial for multiprocessing to work correctly on some platforms (like Windows).
-# It ensures that main_script_logic() is only called when the script is executed directly,
-# not when it's imported by worker processes.
 if __name__ == "__main__":
     script_start_time = datetime.datetime.now()
     print(f"Script started at: {script_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
     try:
         main_script_logic()
-    except Exception as e: # Catch any unexpected critical errors in the main execution flow
+    except Exception as e: 
         print("---------------------------------------------------")
         print("AN UNEXPECTED CRITICAL ERROR OCCURRED IN THE SCRIPT (MAIN BLOCK):")
-        print(str(e))
-        print("---------------------------------------------------")
+        print(str(e)); print("---------------------------------------------------")
         traceback.print_exc()
     finally:
         script_end_time = datetime.datetime.now()
