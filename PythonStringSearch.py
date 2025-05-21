@@ -348,6 +348,7 @@ def log_skipped_files(skipped_records, output_file_path_param):
         print(f"Error: Could not write skipped files log to '{output_file_path_param}': {e}")
 
 
+# This guard is crucial for multiprocessing to work correctly on some platforms (like Windows).
 if __name__ == "__main__":
     script_start_time = datetime.datetime.now()
     print(f"Script started at: {script_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -363,5 +364,28 @@ if __name__ == "__main__":
         script_end_time = datetime.datetime.now()
         print(f"Script finished at: {script_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Total execution time: {script_end_time - script_start_time}")
+
+        # --- Attempt to open the output file ---
+        # Check if the output file path is defined and the file actually exists
+        if 'output_file_path' in globals() and os.path.exists(output_file_path):
+            print(f"\nAttempting to open output file: {output_file_path}")
+            try:
+                os.startfile(output_file_path) # This is Windows-specific
+            except AttributeError:
+                # This might happen if 'os.startfile' is not available (e.g., not on Windows)
+                # or if the script is run in an environment where it's restricted.
+                print(f"Info: 'os.startfile()' not available on this system or failed. Please open the file manually.")
+                # You could add a fallback for other systems if needed, e.g., using webbrowser
+                # import webbrowser
+                # try:
+                #     webbrowser.open(os.path.realpath(output_file_path))
+                # except Exception as e_wb:
+                #      print(f"Info: Could not open file with webbrowser: {e_wb}")
+            except Exception as e_startfile:
+                print(f"Error: Could not automatically open the output file '{output_file_path}': {e_startfile}")
+        elif 'output_file_path' in globals():
+            print(f"\nInfo: Output file '{output_file_path}' not found or not created. Cannot open it automatically.")
+        # --- End of attempting to open the output file ---
+
         print("\n--- Script execution finished or was interrupted ---")
         input("Press Enter to exit...")
