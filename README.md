@@ -106,7 +106,3 @@ The output file specified by `output_file_path` will contain:
 * **Binary File Content:** The script is designed to search for text strings. While it can *attempt* to read any non-ignored, non-gz file as text (trying UTF-8 then Latin-1), searching for strings within compiled binaries or proprietary binary formats will likely not yield meaningful results. The `errors='ignore'` flag means unreadable binary content will be skipped over silently within a line.
 * **Specific Binary Formats:** Direct parsing of specific structured binary formats (e.g., raw systemd journal files, `.evtx` before conversion) is not supported. Such files should be converted to a text-based format (like CSV, plain text, or JSON lines) first if their content needs to be searched by this script, or added to `ignore_extensions`.
 * **No Intra-File Parallelism for CPU-Bound Search:** The search for strings within the lines of a single file (after it's read/decompressed) is performed sequentially by the worker assigned to that file. For extremely long lines or highly complex (though currently not used) regex patterns, this part could be CPU-intensive for that single worker.
-
-## License
-
-You can add a license here if you wish (e.g., MIT License).
